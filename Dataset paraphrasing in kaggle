@@ -1,0 +1,100 @@
+#code for dataset paraphrasing in kaggle
+!pip install -q pandas torch transformers nltk tqdm
+import pandas as pd
+import re
+import torch
+import os
+from transformers import pipeline
+from nltk.tokenize import sent_tokenize
+from nltk import download
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
+from IPython.display import FileLink
+
+# Download NLTK punkt tokenizer
+download('punkt')
+
+# CONFIG
+FULL_DATA_CSV = "/kaggle/input/poda-deii-thambi/splitted_100000_150000_indian-legal-data-part1.1 (1).csv"  # Path to your CSV
+TEXT_COLUMN = "text"  # Replace this if your column name is different
+BATCH_SIZE = 2000  # Processing 2000 rows at a time
+
+# Define start and end index for processing
+START_INDEX = 0 # Start index (e.g., row 0 in the dataset)
+END_INDEX = 2000  # End index (e.g., row 2000 in the dataset)
+
+# Load dual-GPU grammar correction model
+pipe_gpu0 = pipeline('text2text-generation', model='vennify/t5-base-grammar-correction', device=0)
+pipe_gpu1 = pipeline('text2text-generation', model='vennify/t5-base-grammar-correction', device=1)
+
+# Cleaning functions
+def clean_ocr_text(text):
+    if not isinstance(text, str): return ""
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'-\s+', '', text)
+    text = re.sub(r'\b[a-z]{1,2}\b', '', text)
+    text = re.sub(r'[^\w\s\.,]', '', text)
+    text = re.sub(r'\bappea\b', 'appeal', text)
+    text = re.sub(r'\bsuceessful\b', 'successful', text)
+    text = re.sub(r'\bap proached\b', 'approached', text)
+    text = re.sub(r'\bprematurely determined\b', 'predetermined', text)
+    return text.strip()
+
+def strip_inst_tokens(text):
+    if not isinstance(text, str): return ""
+    text = re.sub(r'<s>\[INST\].*?\[/INST\]', '', text, flags=re.DOTALL)
+    return re.sub(r'</s>', '', text).strip()
+
+def fix_last_sentence(text):
+    if not isinstance(text, str): return ""
+    sentences = sent_tokenize(text)
+    if not sentences: return ""
+    last = sentences[-1].strip()
+    if len(last) < 6 or not re.search(r'[.!?]$', last):
+        sentences[-1] = last + "."
+    return " ".join(sentences)
+
+def correct_half(data_half, pipeline):
+    results = []
+    for text in tqdm(data_half, desc="Grammar Correction"):
+        try:
+            cleaned = strip_inst_tokens(text)
+            sentences = sent_tokenize(cleaned)
+            prompts = ["grammar: " + s for s in sentences if s.strip()]
+            outputs = []
+            for i in range(0, len(prompts), 64):
+                batch = prompts[i:i+64]
+                output = pipeline(batch, max_length=256, truncation=True)
+                batch_outputs = [o["generated_text"].capitalize() for o in output]
+                outputs.extend(batch_outputs)
+            results.append(fix_last_sentence(" ".join(outputs)))
+        except Exception as e:
+            results.append("")
+            print("⚠️ Error:", e)
+    return results
+
+# Process and save the given range of data
+df = pd.read_csv(FULL_DATA_CSV, skiprows=range(1, START_INDEX + 1), nrows=END_INDEX - START_INDEX, encoding='ISO-8859-1')
+df.columns = df.columns.str.strip()  # Clean column names
+df[f"{TEXT_COLUMN}_cleaned"] = df[TEXT_COLUMN].apply(clean_ocr_text)
+
+texts = df[f"{TEXT_COLUMN}_cleaned"].tolist()
+mid = len(texts) // 2
+texts0, texts1 = texts[:mid], texts[mid:]
+
+# Use ThreadPoolExecutor for parallel processing
+with ThreadPoolExecutor(max_workers=2) as executor:
+    f0 = executor.submit(correct_half, texts0, pipe_gpu0)
+    f1 = executor.submit(correct_half, texts1, pipe_gpu1)
+    r0 = f0.result()
+    r1 = f1.result()
+
+# Combine results and save to CSV
+output_file = f"/kaggle/working/cleaned_batch_{START_INDEX+1}_{END_INDEX}.csv"
+df[f"{TEXT_COLUMN}_final"] = r0 + r1
+df[[f"{TEXT_COLUMN}_final"]].to_csv(output_file, index=False)
+
+print(f"✅ Saved: {output_file}")
+display(FileLink(output_file))  # Automatic download link
+
+print("\n Processing completed for the given range!")
